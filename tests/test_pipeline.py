@@ -1,0 +1,619 @@
+from __future__ import annotations
+
+import asyncio
+import json
+from pathlib import Path
+import tempfile
+import unittest
+
+import numpy as np
+from PIL import Image
+
+from driveharm.audit import audit_release
+from driveharm.cli import _accepted_jobs, _asset_review_manifest
+from driveharm.compose import compose_results, edit_overlap_pass, geometry_pass
+from driveharm.contracts import atomic_json, atomic_jsonl, canonical_sha256, sha256_file
+from driveharm.planning import _window_selections, build_plan
+from driveharm.release import publish_release, quarantine_triplets
+import driveharm.render as render_module
+import driveharm.review as review_module
+
+
+SIZE = (512, 288)
+
+
+def save_rgb(path: Path, value: np.ndarray) -> None:
+    Image.fromarray(value.astype(np.uint8), mode="RGB").save(path)
+
+
+def save_mask(path: Path, value: np.ndarray) -> None:
+    Image.fromarray(value.astype(np.uint8), mode="L").save(path)
+
+
+class PipelineTests(unittest.TestCase):
+    def test_train_window_subsets_are_instance_safe_and_capped(self) -> None:
+        def member(obj_id: str, instance: str) -> dict:
+            return {"assets": [{"obj_id": obj_id, "instance_token": instance}]}
+
+        members = {
+            "a1": member("a1", "actor-a"),
+            "a2": member("a2", "actor-a"),
+            "b1": member("b1", "actor-b"),
+            "c1": member("c1", "actor-c"),
+        }
+        first = _window_selections(members, 6, 20260818, "scene:w000001")
+        second = _window_selections(members, 6, 20260818, "scene:w000001")
+        self.assertEqual(first, second)
+        self.assertEqual(len(first), 6)
+        self.assertTrue({("a1",), ("a2",), ("b1",), ("c1",)}.issubset(first))
+        self.assertFalse(any({"a1", "a2"}.issubset(selection) for selection in first))
+
+    def test_train_exact_capacity_and_identity_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            (root / "assets/car").mkdir(parents=True)
+            ply = root / "assets/car/car.ply"
+            ply.write_bytes(b"ply\nformat ascii 1.0\nend_header\n")
+            asset_sha = sha256_file(ply)
+            exact = root / "exact_assets.json"
+            atomic_json(
+                exact,
+                {
+                    "assets": [
+                        {
+                            "global_uid": "nuscenes_car_scene-0001__token-1",
+                            "obj_id": "scene-0001__token-1",
+                            "instance_token": "token-1",
+                            "category": "car",
+                            "asset_path": "assets/car/car.ply",
+                            "size_xyz": [1, 1, 1],
+                            "canonical": {
+                                "canonical_asset_sha256": asset_sha,
+                                "front_axis": "+X",
+                            },
+                        }
+                    ]
+                },
+            )
+            post = root / "post.json"
+            atomic_json(
+                post,
+                {
+                    "status": "complete",
+                    "manifest": exact.name,
+                    "manifest_sha256": sha256_file(exact),
+                },
+            )
+            sheet = root / "sheet.png"
+            save_rgb(sheet, np.zeros((SIZE[1], SIZE[0], 3), dtype=np.uint8))
+            identity = root / "identity.jsonl"
+            atomic_jsonl(
+                identity,
+                [
+                    {
+                        "obj_id": "scene-0001__token-1",
+                        "instance_token": "token-1",
+                        "category": "car",
+                        "canonical_asset_sha256": asset_sha,
+                        "review_sheet": str(sheet),
+                        "review_sheet_sha256": sha256_file(sheet),
+                    }
+                ],
+            )
+            capacity = root / "exact_asset_windows.jsonl"
+            atomic_jsonl(
+                capacity,
+                [
+                    {
+                        "scene_name": "scene-0001",
+                        "context_start": 10,
+                        "context_frames": [10, 15, 20, 25],
+                        "target_frames": [13, 17],
+                        "quality_tier": "high",
+                        "candidates": [
+                            {
+                                "obj_id": "scene-0001__token-1",
+                                "instance_token": "token-1",
+                                "official_size_wlh_m": [1.8, 4.2, 1.6],
+                                "projected_area_native_pixels": 300,
+                                "visibility_token": 4,
+                                "visible_target_frame_camera_keys": [
+                                    "000013:c0",
+                                    "000017:c3",
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            )
+            summary = build_plan(post, capacity, root / "plan", identity)
+            self.assertEqual(summary["job_count"], 2)
+            rows = [
+                json.loads(line)
+                for line in Path(summary["jobs"]).read_text().splitlines()
+            ]
+            self.assertEqual({row["camera_id"] for row in rows}, {"0", "3"})
+            self.assertTrue(
+                all(row["official_dimensions_m"] == [4.2, 1.8, 1.6] for row in rows)
+            )
+
+    def test_00_multi_gpu_batch_dispatch_binds_results(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            jobs = []
+            for index in range(6):
+                job = {
+                    "sample_id": f"sample-{index}",
+                    "job_sha256": f"hash-{index}",
+                    "selected_obj_ids": [f"obj-{index}"],
+                    "camera_id": str(index % 6),
+                    "frame_index": index,
+                }
+                jobs.append(job)
+            jobs_path = root / "jobs.jsonl"
+            atomic_jsonl(jobs_path, jobs)
+            renderer = root / "renderer.py"
+            renderer.write_text("executable marker\n", encoding="utf-8")
+            renderer.chmod(0o755)
+            checkpoints = {}
+            checkpoint_hashes = {}
+            for name in ("storm", "cvac", "dcn"):
+                path = root / f"{name}.ckpt"
+                path.write_text(name, encoding="utf-8")
+                checkpoint_hashes[name] = sha256_file(path)
+                checkpoints[name] = {
+                    "path": str(path),
+                    "sha256": checkpoint_hashes[name],
+                }
+            render_contract = root / "render_contract.json"
+            atomic_json(render_contract, {"artifacts": checkpoints})
+            calls = {"count": 0}
+
+            class FakeProcess:
+                returncode = 0
+
+                async def communicate(self):
+                    await asyncio.sleep(0.01)
+                    return b"ok", None
+
+            async def create_process(*args, **kwargs):
+                calls["count"] += 1
+                arguments = list(args)
+                manifest = Path(arguments[arguments.index("--jobs") + 1])
+                results = Path(arguments[arguments.index("--results") + 1])
+                rows = [json.loads(line) for line in manifest.read_text().splitlines()]
+                atomic_jsonl(
+                    results,
+                    [
+                        {
+                            **{
+                                key: row[key]
+                                for key in (
+                                    "sample_id",
+                                    "job_sha256",
+                                    "selected_obj_ids",
+                                    "camera_id",
+                                    "frame_index",
+                                )
+                            },
+                            "status": "complete",
+                            "checkpoint_sha256": checkpoint_hashes,
+                        }
+                        for row in rows
+                    ],
+                )
+                return FakeProcess()
+
+            original = render_module.asyncio.create_subprocess_exec
+            render_module.asyncio.create_subprocess_exec = create_process
+            try:
+                summary = asyncio.run(
+                    render_module.render_shards(
+                        jobs_path,
+                        root / "render",
+                        renderer,
+                        render_contract,
+                        gpus=(0, 1),
+                    )
+                )
+            finally:
+                render_module.asyncio.create_subprocess_exec = original
+            self.assertEqual(summary["job_count"], 6)
+            self.assertEqual(summary["gpu_ids"], [0, 1])
+            self.assertEqual(sum(row["job_count"] for row in summary["executions"]), 6)
+            resumed = asyncio.run(
+                render_module.render_shards(
+                    jobs_path,
+                    root / "render",
+                    renderer,
+                    render_contract,
+                    gpus=(0, 1),
+                )
+            )
+            self.assertEqual(calls["count"], 1)
+            self.assertEqual(resumed["resumed_shard_count"], 1)
+
+    def test_async_json_schema_review_is_concurrent(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            image_path = root / "view.png"
+            save_rgb(image_path, np.zeros((SIZE[1], SIZE[0], 3), dtype=np.uint8))
+            manifest = root / "review.jsonl"
+            atomic_jsonl(
+                manifest,
+                [
+                    {
+                        "sample_id": f"sample-{index}",
+                        "review_images": {"input": str(image_path)},
+                    }
+                    for index in range(8)
+                ],
+            )
+            state = {"active": 0, "maximum": 0, "formats": []}
+
+            class FakeCompletions:
+                async def create(self, **kwargs):
+                    state["active"] += 1
+                    state["maximum"] = max(state["maximum"], state["active"])
+                    state["formats"].append(kwargs["response_format"])
+                    await asyncio.sleep(0.01)
+                    state["active"] -= 1
+                    decision = {
+                        "decision": "accept",
+                        "same_identity": True,
+                        "broken_or_doubled_asset": False,
+                        "orientation_valid": True,
+                        "scale_valid": True,
+                        "grounding_valid": True,
+                        "severe_occlusion_error": False,
+                        "confidence": 0.9,
+                        "reason": "ok",
+                    }
+                    message = type("Message", (), {"content": json.dumps(decision)})()
+                    choice = type("Choice", (), {"message": message})()
+                    return type("Response", (), {"choices": [choice]})()
+
+            class FakeClient:
+                def __init__(self, **kwargs):
+                    self.chat = type("Chat", (), {"completions": FakeCompletions()})()
+
+                async def close(self):
+                    return None
+
+            original = review_module.AsyncOpenAI
+            review_module.AsyncOpenAI = FakeClient
+            try:
+                summary = asyncio.run(
+                    review_module.review_manifest(
+                        manifest,
+                        root / "reviews",
+                        "http://localhost/v1",
+                        "local",
+                        "model",
+                        4,
+                    )
+                )
+            finally:
+                review_module.AsyncOpenAI = original
+            self.assertEqual(summary["accepted_count"], 8)
+            self.assertGreaterEqual(state["maximum"], 2)
+            self.assertTrue(
+                all(value["type"] == "json_schema" for value in state["formats"])
+            )
+            reused = asyncio.run(
+                review_module.review_manifest(
+                    manifest,
+                    root / "reviews",
+                    "http://localhost/v1",
+                    "local",
+                    "model",
+                    4,
+                )
+            )
+            self.assertEqual(reused["reused_count"], 8)
+            self.assertEqual(reused["requested_count"], 0)
+
+    def test_any_camera_plan_and_asset_hash_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            ply = root / "asset.ply"
+            ply.write_bytes(b"ply\nformat ascii 1.0\nend_header\n")
+            ply2 = root / "asset2.ply"
+            ply2.write_bytes(b"ply\nformat ascii 1.0\ncomment second\nend_header\n")
+            save_rgb(
+                root / "unused.png", np.zeros((SIZE[1], SIZE[0], 3), dtype=np.uint8)
+            )
+            save_rgb(
+                root / "unused2.png", np.zeros((SIZE[1], SIZE[0], 3), dtype=np.uint8)
+            )
+            manifest = root / "assets.jsonl"
+            atomic_jsonl(
+                manifest,
+                [
+                    {
+                        "asset_id": "asset-0001",
+                        "obj_id": "obj-1",
+                        "instance_token": "token-1",
+                        "category": "car",
+                        "ply_path": str(ply),
+                        "ply_sha256": sha256_file(ply),
+                        "dimensions_m": [4.2, 1.8, 1.6],
+                        "forward_axis": "+X",
+                    },
+                    {
+                        "asset_id": "asset-0002",
+                        "obj_id": "obj-2",
+                        "instance_token": "token-2",
+                        "category": "car",
+                        "ply_path": str(ply2),
+                        "ply_sha256": sha256_file(ply2),
+                        "dimensions_m": [4.0, 1.7, 1.5],
+                        "forward_axis": "+X",
+                    },
+                ],
+            )
+            post = root / "post.json"
+            atomic_json(
+                post,
+                {
+                    "status": "complete",
+                    "manifest": str(manifest),
+                    "manifest_sha256": sha256_file(manifest),
+                },
+            )
+            observations = root / "observations.jsonl"
+            atomic_jsonl(
+                observations,
+                [
+                    {
+                        "scene_name": "scene-0001",
+                        "window_id": "w000010",
+                        "frame_index": 12,
+                        "obj_id": "obj-1",
+                        "instance_token": "token-1",
+                        "area_pixels": 300,
+                        "visibility_level": 4,
+                        "visible_cameras": ["c3", "0"],
+                        "review_images": {"reference": str(root / "unused.png")},
+                    },
+                    {
+                        "scene_name": "scene-0001",
+                        "window_id": "w000010",
+                        "frame_index": 12,
+                        "obj_id": "obj-2",
+                        "instance_token": "token-2",
+                        "area_pixels": 250,
+                        "visibility_level": 4,
+                        "visible_cameras": ["c3"],
+                        "review_images": {"reference": str(root / "unused2.png")},
+                    },
+                ],
+            )
+            summary = build_plan(post, observations, root / "plan")
+            self.assertEqual(summary["job_count"], 4)
+            self.assertEqual(summary["combination_job_count"], 1)
+            self.assertEqual(summary["camera_counts"], {"0": 1, "3": 3})
+            self.assertEqual(summary["camera_policy"], "any_visible_camera")
+            asset_reviews = root / "asset_reviews.jsonl"
+            _asset_review_manifest(Path(summary["jobs"]), asset_reviews)
+            self.assertEqual(len(asset_reviews.read_text().splitlines()), 2)
+            decisions = root / "decisions.jsonl"
+            atomic_jsonl(
+                decisions,
+                [
+                    {"sample_id": "asset-0001", "hard_failure": False},
+                    {"sample_id": "asset-0002", "hard_failure": True},
+                ],
+            )
+            reviewed_jobs = root / "reviewed_jobs.jsonl"
+            _accepted_jobs(Path(summary["jobs"]), decisions, reviewed_jobs)
+            self.assertEqual(len(reviewed_jobs.read_text().splitlines()), 2)
+
+    def test_compose_occlusion_audit_release_and_quarantine(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            sources = root / "sources"
+            sources.mkdir()
+            grey = np.full((SIZE[1], SIZE[0], 3), 100, dtype=np.uint8)
+            removed = grey.copy()
+            asset = np.zeros_like(grey)
+            alpha = np.zeros((SIZE[1], SIZE[0]), dtype=np.uint8)
+            alpha[80:180, 150:250] = 255
+            removed[80:180, 150:250] = 0
+            asset[80:180, 150:250, 0] = 255
+            foreground = np.zeros_like(alpha)
+            foreground[80:100, 150:250] = 255
+            exact = foreground.copy()
+            paths = {
+                "real_gt": sources / "gt.png",
+                "storm_baseline": sources / "target.png",
+                "actor_removed": sources / "removed.png",
+                "actor_removed_mask": sources / "removed_mask.png",
+                "rgb": sources / "asset.png",
+                "alpha": sources / "alpha.png",
+                "foreground": sources / "foreground.png",
+                "exact": sources / "exact.png",
+            }
+            save_rgb(paths["real_gt"], grey)
+            save_rgb(paths["storm_baseline"], grey)
+            save_rgb(paths["actor_removed"], removed)
+            save_mask(paths["actor_removed_mask"], alpha)
+            save_rgb(paths["rgb"], asset)
+            save_mask(paths["alpha"], alpha)
+            save_mask(paths["foreground"], foreground)
+            save_mask(paths["exact"], exact)
+            quality = {
+                "target_actor_pixels": 10000,
+                "complete_projected_asset_pixels": 10000,
+                "silhouette_iou": 0.9,
+                "center_error_px": 0,
+                "width_ratio": 1,
+                "height_ratio": 1,
+                "bottom_error_px": 0,
+                "orientation_error_deg": 0,
+                "ground_lock_pass": True,
+                "catastrophic_asset_safety_pass": True,
+                "broken_or_doubled_asset": False,
+                "verified_foreground_occlusion_applied": True,
+                "degenerate_rectangle_mask": False,
+            }
+            cleanup = {"observation_technical_usable": True, "quality_gate_pass": True}
+            cleanup["decision_sha256"] = canonical_sha256(cleanup)
+            result = {
+                "status": "complete",
+                "sample_id": "scene-0001__w000010__asset__f012_c3",
+                "scene_name": "scene-0001",
+                "frame_index": 12,
+                "camera_id": "3",
+                "render_domain": "storm",
+                "camera_exposure": {
+                    "sample_data_timestamp_us": 123456,
+                    "camera_exposure_timestamp_us": 123456,
+                    "storm_normalized_time_seconds": 1.25,
+                },
+                "original_actor_cleanup_receipt": cleanup,
+                "quality": {
+                    "target_storm_vs_sensor_before_insertion": {
+                        "quality_gate_pass": True
+                    }
+                },
+                "paths": {
+                    key: str(paths[key])
+                    for key in (
+                        "real_gt",
+                        "storm_baseline",
+                        "actor_removed",
+                        "actor_removed_mask",
+                    )
+                },
+                "source_sha256": {
+                    key: sha256_file(paths[key])
+                    for key in (
+                        "real_gt",
+                        "storm_baseline",
+                        "actor_removed",
+                        "actor_removed_mask",
+                    )
+                },
+                "asset_layers": [
+                    {
+                        "obj_id": "obj-1",
+                        "instance_token": "token-1",
+                        "asset_sha256": "a" * 64,
+                        "exact_identity_verified": True,
+                        "rgb": str(paths["rgb"]),
+                        "alpha": str(paths["alpha"]),
+                        "official_dimensions_m": [4.2, 1.8, 1.6],
+                        "forward_axis": "+X",
+                        "official_dimensions_applied": True,
+                        "canonical_orientation_applied": True,
+                        "bottom_ground_locked": True,
+                        "content_sha256": {
+                            "rgb": sha256_file(paths["rgb"]),
+                            "alpha": sha256_file(paths["alpha"]),
+                            "foreground_occlusion_mask": sha256_file(
+                                paths["foreground"]
+                            ),
+                            "target_exact_mask": sha256_file(paths["exact"]),
+                        },
+                        "median_depth_m": 10,
+                        "quality": quality,
+                        "foreground_occlusion_mask": str(paths["foreground"]),
+                        "target_exact_mask": str(paths["exact"]),
+                        "foreground_occlusion_receipt": {
+                            "independent_foreground_verified": True,
+                            "renderer_verified_occlusion_pixels": 2000,
+                            "restored_asset_pixels": 0,
+                            "official_instance_decisions": [
+                                {
+                                    "is_distinct_from_target": True,
+                                    "official_annotation_bound": True,
+                                    "strictly_nearer_than_target": True,
+                                }
+                            ],
+                        },
+                    }
+                ],
+            }
+            results = root / "results.jsonl"
+            atomic_jsonl(results, [result])
+            composed = compose_results(results, root / "composed")
+            candidate_rows = [
+                json.loads(line)
+                for line in (root / "composed/candidates.jsonl")
+                .read_text()
+                .splitlines()
+            ]
+            self.assertEqual(composed["accepted_count"], 1, candidate_rows)
+            with Image.open(
+                root / "composed/input" / f"{result['sample_id']}.png"
+            ) as image:
+                output = np.asarray(image)
+            self.assertTrue(np.all(output[85, 175] == 0))
+            self.assertEqual(int(output[120, 175, 0]), 255)
+            audited = audit_release(
+                root / "composed", Path(composed["records"]), root / "audit"
+            )
+            self.assertEqual(audited["accepted_count"], 1)
+            destination = root / "release"
+            receipt = publish_release(
+                [root / "composed", root / "composed"],
+                [Path(audited["accepted_records"]), Path(audited["accepted_records"])],
+                destination,
+                root / "receipts",
+                "copy",
+            )
+            self.assertEqual(receipt["triplet_count"], 1)
+            self.assertEqual(receipt["duplicate_exclusion_count"], 1)
+            candidate_ids = root / "candidate_ids.txt"
+            candidate_ids.write_text(result["sample_id"] + "\n", encoding="utf-8")
+            quarantined = quarantine_triplets(
+                destination,
+                candidate_ids,
+                root / "quarantine",
+                root / "quarantine.json",
+            )
+            self.assertEqual(quarantined["retained_count"], 0)
+
+    def test_geometry_gate_rejects_clear_reversal(self) -> None:
+        quality = {
+            "target_actor_pixels": 2000,
+            "complete_projected_asset_pixels": 2000,
+            "silhouette_iou": 0.8,
+            "center_error_px": 1,
+            "width_ratio": 1,
+            "height_ratio": 1,
+            "bottom_error_px": 1,
+            "orientation_error_deg": 170,
+            "ground_lock_pass": True,
+            "catastrophic_asset_safety_pass": True,
+            "broken_or_doubled_asset": False,
+        }
+        self.assertFalse(geometry_pass(quality))
+
+    def test_train_two_percent_edit_overlap(self) -> None:
+        first = np.zeros((20, 20), dtype=bool)
+        second = np.zeros_like(first)
+        first[:10, :10] = True
+        second[10:20, 10:20] = True
+        second[9, :3] = True
+        self.assertFalse(edit_overlap_pass([first, second]))
+        second[9, 2] = False
+        self.assertTrue(edit_overlap_pass([first, second]))
+
+    def test_delivery_contracts(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        python_files = sorted(root.glob("driveharm/*.py")) + sorted(
+            root.glob("tests/*.py")
+        )
+        self.assertLessEqual(len(python_files), 10)
+        source = "\n".join(path.read_text(encoding="utf-8") for path in python_files)
+        self.assertIn("AsyncOpenAI", source)
+        self.assertIn("await client.chat.completions.create", source)
+        self.assertIn('"type": "json_schema"', source)
+        self.assertNotIn("re" + "quests", source.lower())
+        self.assertNotIn("fall" + "back", source.lower())
+
+
+if __name__ == "__main__":
+    unittest.main()
