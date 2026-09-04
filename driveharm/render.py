@@ -132,6 +132,7 @@ async def render_shards(
         atomic_jsonl(manifest, shard_jobs)
         environment = dict(os.environ)
         environment["CUDA_VISIBLE_DEVICES"] = str(gpu)
+        environment["DRIVEHARM_PHYSICAL_GPU"] = str(gpu)
         process = await asyncio.create_subprocess_exec(
             str(renderer),
             *renderer_args,

@@ -537,7 +537,12 @@ class PipelineTests(unittest.TestCase):
             }
             results = root / "results.jsonl"
             atomic_jsonl(results, [result])
+            for role in ("gt", "input", "target"):
+                stale = root / "composed" / role / "stale.png"
+                stale.parent.mkdir(parents=True, exist_ok=True)
+                save_rgb(stale, grey)
             composed = compose_results(results, root / "composed")
+            self.assertFalse((root / "composed/gt/stale.png").exists())
             candidate_rows = [
                 json.loads(line)
                 for line in (root / "composed/candidates.jsonl")
@@ -591,6 +596,31 @@ class PipelineTests(unittest.TestCase):
         }
         self.assertFalse(geometry_pass(quality))
 
+    def test_geometry_gate_preserves_strict_renderer_proof(self) -> None:
+        quality = {
+            "target_actor_pixels": 1680,
+            "complete_projected_asset_pixels": 1680,
+            "silhouette_iou": 0.74,
+            "center_error_px": 2.5,
+            "width_ratio": 1.01,
+            "height_ratio": 0.76,
+            "bottom_error_px": 4,
+            "orientation_error_deg": 2,
+            "ground_lock_pass": True,
+            "catastrophic_asset_safety_pass": True,
+            "broken_or_doubled_asset": False,
+            "renderer_quality_gate_pass": True,
+            "renderer_geometry_gate_pass": True,
+        }
+        self.assertTrue(geometry_pass(quality))
+        quality["orientation_error_deg"] = 170
+        # Contradictory clear-reversal evidence remains a hard failure even if
+        # an upstream strict proof claims success.
+        self.assertFalse(geometry_pass(quality))
+        quality["orientation_error_deg"] = 2
+        quality["renderer_geometry_gate_pass"] = False
+        self.assertFalse(geometry_pass(quality))
+
     def test_train_two_percent_edit_overlap(self) -> None:
         first = np.zeros((20, 20), dtype=bool)
         second = np.zeros_like(first)
@@ -601,12 +631,81 @@ class PipelineTests(unittest.TestCase):
         second[9, 2] = False
         self.assertTrue(edit_overlap_pass([first, second]))
 
+    def test_static_depth_occlusion_receipt_is_accepted(self) -> None:
+        from driveharm.compose import _verified_foreground
+
+        receipt = {
+            "schema_version": 1,
+            "policy": "distinct_nearer_official_or_static_depth_v1",
+            "target_instance_token": "a" * 32,
+            "target_center_depth_m": 20.0,
+            "absolute_depth_margin_m": 0.3,
+            "relative_depth_margin": 0.02,
+            "minimum_overlap_pixels": 16,
+            "minimum_static_seed_pixels": 4,
+            "image_shape_hw": [288, 512],
+            "scene_depth_sha256": "a" * 64,
+            "asset_depth_sha256": "b" * 64,
+            "nearer_depth_support_sha256": "c" * 64,
+            "official_instance_decisions": [],
+            "static_region_decisions": [
+                {
+                    "evidence_kind": "unannotated_static_depth_seed_region",
+                    "minimum_verified_seed_pixels_per_component": 4,
+                    "components": [
+                        {
+                            "component_index": 1,
+                            "component_pixels": 20,
+                            "verified_nearer_seed_pixels": 6,
+                            "accepted": True,
+                        }
+                    ],
+                    "accepted_component_indices": [1],
+                    "selected_pixels": 20,
+                    "accepted": True,
+                }
+            ],
+            "selected_occlusion_pixels": 20,
+            "target_exact_is_diagnostic_only": True,
+            "target_exact_overlap_pixels": 0,
+            "quality_gate_pass": True,
+            "independent_foreground_verified": True,
+            "renderer_verified_occlusion_pixels": 20,
+            "restored_asset_pixels": 0,
+        }
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            foreground = np.zeros((SIZE[1], SIZE[0]), dtype=np.uint8)
+            foreground[20:24, 20:25] = 255
+            path = root / "foreground.png"
+            save_mask(path, foreground)
+            alpha = np.zeros((SIZE[1], SIZE[0]), dtype=np.float32)
+            alpha[10:30, 10:30] = 1.0
+            from driveharm.compose import _array_sha256
+
+            receipt["full_asset_support_sha256"] = _array_sha256(
+                (alpha > 0.02).astype(np.uint8)
+            )
+            receipt["selected_occlusion_mask_sha256"] = _array_sha256(
+                (foreground > 0).astype(np.uint8)
+            )
+            receipt["decision_sha256"] = canonical_sha256(receipt)
+            selected, summary = _verified_foreground(
+                {
+                    "foreground_occlusion_mask": str(path),
+                    "foreground_occlusion_receipt": receipt,
+                },
+                alpha,
+            )
+            self.assertEqual(int(selected.sum()), 20)
+            self.assertTrue(summary["applied"])
+
     def test_delivery_contracts(self) -> None:
         root = Path(__file__).resolve().parents[1]
         python_files = sorted(root.glob("driveharm/*.py")) + sorted(
             root.glob("tests/*.py")
         )
-        self.assertLessEqual(len(python_files), 10)
+        self.assertLessEqual(len(python_files), 11)
         source = "\n".join(path.read_text(encoding="utf-8") for path in python_files)
         self.assertIn("AsyncOpenAI", source)
         self.assertIn("await client.chat.completions.create", source)

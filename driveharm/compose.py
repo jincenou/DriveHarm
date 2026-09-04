@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import os
 from pathlib import Path
@@ -50,6 +51,10 @@ def _save_rgb(path: Path, value: np.ndarray) -> None:
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _array_sha256(value: np.ndarray) -> str:
+    return hashlib.sha256(np.ascontiguousarray(value).tobytes()).hexdigest()
 
 
 def geometry_thresholds(projected_pixels: int) -> dict[str, float]:
@@ -107,17 +112,25 @@ def geometry_pass(quality: dict[str, Any]) -> bool:
     bottom = number("bottom_error_px", math.inf)
     yaw = quality.get("orientation_error_deg")
     occluded = quality.get("verified_foreground_occlusion_applied") is True
-    return bool(
+    hard_safety = bool(
+        quality.get("ground_lock_pass") is True
+        and quality.get("catastrophic_asset_safety_pass") is True
+        and quality.get("broken_or_doubled_asset") is not True
+        and (yaw is None or abs(float(yaw)) < 90.0)
+    )
+    strict_renderer_proof = bool(
+        quality.get("renderer_quality_gate_pass") is True
+        and quality.get("renderer_geometry_gate_pass") is True
+    )
+    adaptive_recovery = bool(
         iou >= limits["iou"]
         and center <= limits["center"]
         and limits["ratio_low"] <= width <= limits["ratio_high"]
         and limits["ratio_low"] <= height <= limits["ratio_high"]
         and (occluded or bottom <= limits["bottom"])
         and (yaw is None or float(yaw) <= limits["yaw"])
-        and quality.get("ground_lock_pass") is True
-        and quality.get("catastrophic_asset_safety_pass") is True
-        and quality.get("broken_or_doubled_asset") is not True
     )
+    return hard_safety and (strict_renderer_proof or adaptive_recovery)
 
 
 def edit_overlap_pass(masks: list[np.ndarray], maximum_fraction: float = 0.02) -> bool:
@@ -135,17 +148,64 @@ def _verified_foreground(
 ) -> tuple[np.ndarray, dict[str, Any]]:
     raw = layer.get("foreground_occlusion_mask")
     if not raw:
-        return np.zeros(alpha.shape, dtype=bool), {"applied": False, "pixels": 0}
+        return np.zeros(alpha.shape, dtype=bool), {
+            "applied": False,
+            "pixels": 0,
+            "renderer_occlusion_regression": False,
+        }
     receipt = layer.get("foreground_occlusion_receipt") or {}
     decisions = receipt.get("official_instance_decisions") or []
-    valid = [
+    valid_official = [
         row
         for row in decisions
         if row.get("is_distinct_from_target") is True
         and row.get("official_annotation_bound") is True
         and row.get("strictly_nearer_than_target") is True
+        and row.get("accepted", True) is True
     ]
-    if not valid or receipt.get("independent_foreground_verified") is not True:
+    valid_static = []
+    for row in receipt.get("static_region_decisions") or []:
+        threshold = int(
+            row.get("minimum_verified_seed_pixels_per_component")
+            or receipt.get("minimum_static_seed_pixels")
+            or 1
+        )
+        accepted = [
+            int(component.get("component_index") or 0)
+            for component in row.get("components") or []
+            if int(component.get("verified_nearer_seed_pixels") or 0) >= threshold
+            and component.get("accepted") is True
+        ]
+        if (
+            row.get("evidence_kind") == "unannotated_static_depth_seed_region"
+            and row.get("accepted") is True
+            and accepted
+            and accepted == list(row.get("accepted_component_indices") or [])
+            and int(row.get("selected_pixels") or 0) > 0
+        ):
+            valid_static.append(row)
+    if receipt.get("schema_version") is not None:
+        unsigned = dict(receipt)
+        claimed = str(unsigned.pop("decision_sha256", ""))
+        if (
+            receipt.get("schema_version") != 1
+            or receipt.get("policy")
+            != "distinct_nearer_official_or_static_depth_v1"
+            or claimed != canonical_sha256(unsigned)
+            or receipt.get("quality_gate_pass") is not True
+        ):
+            raise ValueError("foreground receipt binding is invalid")
+        static_hashes = (
+            receipt.get("scene_depth_sha256"),
+            receipt.get("asset_depth_sha256"),
+            receipt.get("nearer_depth_support_sha256"),
+        )
+        if valid_static and any(len(str(value or "")) != 64 for value in static_hashes):
+            raise ValueError("static foreground depth evidence is not hash-bound")
+    if (
+        (not valid_official and not valid_static)
+        or receipt.get("independent_foreground_verified") is not True
+    ):
         raise ValueError("foreground mask has no independent distinct-nearer proof")
     mask = _mask(Path(str(raw)).resolve(strict=True)) >= 0.5
     selected = mask & (alpha > 0.02)
@@ -159,8 +219,22 @@ def _verified_foreground(
     # independently bound nearer official instance.
     exact_overlap = 0
     if layer.get("target_exact_mask"):
-        exact = _mask(Path(str(layer["target_exact_mask"])).resolve(strict=True)) >= 0.5
+        exact = _mask(Path(str(layer["target_exact_mask"])).resolve(strict=True)) > 0.02
         exact_overlap = int((selected & exact).sum())
+    if receipt.get("schema_version") is not None:
+        claimed_pixels = int(receipt.get("selected_occlusion_pixels") or 0)
+        if claimed_pixels != pixels:
+            raise ValueError("foreground mask pixels differ from its receipt")
+        if receipt.get("full_asset_support_sha256") != _array_sha256(
+            (alpha > 0.02).astype(np.uint8)
+        ) or receipt.get("selected_occlusion_mask_sha256") != _array_sha256(
+            selected.astype(np.uint8)
+        ):
+            raise ValueError("foreground mask support differs from its receipt")
+        if layer.get("target_exact_mask") and receipt.get(
+            "target_exact_support_sha256"
+        ) != _array_sha256(exact.astype(np.uint8)):
+            raise ValueError("target exact support differs from its receipt")
     renderer_pixels = int(receipt.get("renderer_verified_occlusion_pixels") or 0)
     restored_pixels = int(receipt.get("restored_asset_pixels") or 0)
     regression = bool(
@@ -328,7 +402,9 @@ def compose_results(results_path: Path, output_root: Path) -> dict[str, Any]:
             ):
                 inserted = layer["rgb"] + inserted * (1.0 - layer["alpha"][..., None])
             insertion_delta = np.max(np.abs(inserted - removed), axis=-1) > 0
-            union_insert = np.logical_or.reduce(visible_masks)
+            # The 0.02 threshold is a visibility/geometry definition, not an
+            # edit-authorisation boundary. Preserve the low-alpha Gaussian rim.
+            union_insert = np.logical_or.reduce([row["alpha"] > 0 for row in layers])
             if int(insertion_delta.sum()) < 20:
                 raise ValueError("asset insertion is ineffective")
             if bool(
@@ -379,6 +455,13 @@ def compose_results(results_path: Path, output_root: Path) -> dict[str, Any]:
                 }
             )
     records_path = output_root / "records.jsonl"
+    accepted_names = {f"{row['sample_id']}.png" for row in accepted}
+    for role in ("gt", "input", "target"):
+        role_root = output_root / role
+        if role_root.is_dir():
+            for path in role_root.glob("*.png"):
+                if path.name not in accepted_names:
+                    path.unlink()
     atomic_jsonl(records_path, accepted)
     atomic_jsonl(output_root / "candidates.jsonl", rejected)
     summary = {

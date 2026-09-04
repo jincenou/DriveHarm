@@ -33,6 +33,10 @@ check at the final quality gate.
 An asset visible in any of the six cameras is eligible. Camera 0 has no special
 status and is not required.
 
+Planning and storage are camera-triplet based: one visible camera produces one
+`gt/input/target` row. An asset visible in all six cameras therefore produces
+six aligned rows, or 18 images in total (six per role), not 12 images.
+
 ## Production stages
 
 1. Verify the upstream asset manifest hash, every PLY hash, `obj_id`, official
@@ -52,15 +56,19 @@ status and is not required.
    resume without another GPU pass.
 5. Compose premultiplied asset layers far-to-near. A foreground mask is applied
    only when an independently bound official instance is distinct from and
-   strictly nearer than the inserted target. Target-instance support is never
-   allowed to erase that physical ordering.
+   strictly nearer than the inserted target, or when a hash-bound static region
+   has enough strictly-nearer scene-depth seeds. This covers vehicles, poles,
+   branches and fences without treating the target's own mask as an occluder.
+   Target-instance support is diagnostic only and can never erase physical
+   ordering.
    The real camera timestamp and normalized STORM time are bound in every row;
    actor removal must be effective and unchanged outside its exact edit mask.
-6. Apply the same reasonable geometry policy as the validated train release:
-   area-aware silhouette/box/orientation limits, official 3-D ground lock,
+6. Apply the same two geometry proof routes as the validated train release:
+   an independently passed strict renderer gate, or the area-aware numeric
+   recovery limits below. Both still require official 3-D ground lock,
    15% minimum complete-asset visibility and hard rejection of broken, doubled
-   or reversed assets. Color, brand, trim and ordinary lighting differences are
-   audit signals, not rejection criteria.
+   or clearly reversed assets. Color, brand, trim and ordinary lighting
+   differences are audit signals, not rejection criteria.
    Multi-asset edit overlap is capped at the train value of 2% of the smaller
    edit mask, and both removal and insertion must change at least 20 pixels.
 7. Review every rendered triplet, then independently check every PNG, content
@@ -82,7 +90,7 @@ status and is not required.
 | STORM/CVAC/DCN consistency | `render.py` verifies the artifact contract and job/frame/camera binding, then batches across eight GPUs |
 | actor removal and same-domain pair | `compose.py` binds camera/STORM time and requires a hash-bound usable cleanup receipt, exact edit mask, STORM target-quality pass and effective removal |
 | scale, pose, grounding and integrity | area-aware train limits plus official dimensions, bottom lock, orientation and broken/doubled checks |
-| physical foreground occlusion | distinct official instance, independent mask, strictly nearer depth, 4%/16-pixel materiality and direct alpha clipping |
+| physical foreground occlusion | distinct official instance or hash-bound static depth region, independent mask, strictly nearer depth, 4%/16-pixel materiality and direct alpha clipping |
 | complete asset visibility | full alpha is retained unless physical foreground evidence exists; visible fraction must be at least 15% |
 | complete release audit | `audit.py` checks every image, record, role membership, hash, duplicate, identity, geometry, occlusion and visual decision |
 | old/new audited union | `release.py` merges repeated source/manifest pairs, excludes duplicate IDs/content, verifies again and atomically activates |
@@ -101,7 +109,10 @@ Foreground occlusion uses the train release's 4% materiality floor with a
 minimum of 16 pixels. This catches the val-only regression in which a distinct
 nearer official instance was incorrectly suppressed by target-instance mask
 protection. It also catches material restoration of occlusion already verified
-by the renderer.
+by the renderer. The final visual gate remains mandatory because sparse fence
+wires and semi-transparent foliage can be under-resolved by a depth map; a
+triplet that visibly overwrites such foreground structure is rejected rather
+than repaired by a speculative image-space rule.
 
 ## External contracts
 
@@ -164,6 +175,47 @@ DriveHarm exposes exactly one physical GPU to each process through
 exact-identity asset layers. Layer receipts carry projection
 metrics plus independently verified foreground masks and official-instance
 depth decisions.
+
+### Frozen train STORM adapter
+
+`driveharm-storm-renderer` is the thin production adapter for the existing
+train renderer. It maps a DriveHarm row back to the exact
+`scene/obj_id/frame/camera` opportunity, verifies `instance_token`, PLY hash,
+official dimensions and canonical `+X`, runs the unchanged STORM/CVAC/DCN
+renderer, then converts its full premultiplied layer and depth evidence into the
+small result contract above. The profile is runtime JSON and is not committed:
+
+```json
+{
+  "repo_root": "/code/storm_dataset",
+  "python": "/envs/storm/bin/python",
+  "job_root": "/data/train/jobs",
+  "data_root": "/data/storm_adapter",
+  "annotation_list": "/data/storm_adapter/scene_list/train_annotations.txt",
+  "raw_nuscenes_root": "/data/nuScenes",
+  "storm_checkpoint": "/models/storm.pth",
+  "cvac_checkpoint": "/models/cvac.pth",
+  "dcn_checkpoint": "/models/dcn.pth"
+}
+```
+
+Pass it through the generic scheduler with two renderer arguments:
+
+```bash
+driveharm render \
+  --jobs /data/run/accepted_jobs.jsonl \
+  --output-root /data/run/03_render \
+  --renderer "$(command -v driveharm-storm-renderer)" \
+  --renderer-arg=--profile \
+  --renderer-arg=/data/train_storm_profile.json \
+  --render-contract /data/render_contract.json \
+  --gpus 0,1,2,3,4,5,6,7 \
+  --workers-per-gpu 1 --shards-per-worker 4
+```
+
+`--reuse-legacy` is only for rebuilding adapter metadata from already complete,
+strictly validated renderer outputs; it refuses to proceed if any frozen result
+is missing and never stands in for rendering.
 
 ## Installation and review server
 
@@ -239,3 +291,21 @@ The four area bins above were also compared directly against the original train
 producer function and matched exactly. The distinct-nearer occluder case is an
 additional regression test and does not change the train generation stages or
 their reasonable thresholds.
+
+## Real pilot evidence
+
+A 35-row isolated pilot covered all six cameras, 12 train scenes, car/bus/van,
+clear views and 13 renderer-declared occlusion cases. Eight scheduler slots
+completed 35/35 real STORM renders. Against each render's own frozen output,
+all 35 `gt` and `target` images were pixel-identical; DriveHarm `input` differed
+only at premultiplied alpha rounding edges (mean MAE 0.0037/255, worst PSNR
+64.62 dB).
+
+The structural audit checked all 105 images. Full-frame plus asset-centred
+visual review then rejected 10 rows: eight views of one car behind wire fencing,
+one chain-link case, and one tree mask that left an implausibly truncated car.
+The remaining 25 triplets were materialized into an isolated release and all 75
+published images passed an independent second audit with zero duplicates or
+candidates. This is evidence that the pipeline preserves train-quality rows and
+excludes clear historical occlusion failures; it is not permission to skip the
+visual gate in a larger run.
